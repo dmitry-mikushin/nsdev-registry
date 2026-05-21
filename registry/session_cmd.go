@@ -125,8 +125,9 @@ var SessionCmd = &cobra.Command{
 				resp.Status, strings.TrimSpace(string(respBody)))
 		}
 		// Pass the JSON through verbatim — nsdev-push parses it from
-		// ssh stdout, so we must not reformat it.
-		_, err = io.Copy(os.Stdout, resp.Body)
+		// ssh stdout, so we must not reformat it. cmd.OutOrStdout()
+		// rather than os.Stdout so tests can capture the output.
+		_, err = io.Copy(cmd.OutOrStdout(), resp.Body)
 		return err
 	},
 }
