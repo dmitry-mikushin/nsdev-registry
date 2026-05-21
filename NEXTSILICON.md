@@ -88,17 +88,116 @@ non-QUIC packet receiver records the kernel-observed (ip, port), and
 the handshake response carries the bearer token plus confirmation that
 the discovery succeeded.
 
-## Quick start (operator)
+## Installation
+
+Three delivery paths are maintained from this repo, all producing
+the same Go binary + the same systemd unit + the same default
+config. Pick whichever matches your host's package management.
+
+### 1. pip / pipx wheel (preferred for workstations and ad-hoc hosts)
+
+Same delivery pattern as `nsdev-server` and `nsdev-push` in the
+parent nsdev tree: a single wheel that bundles the binary as a data
+file, plus a thin Python shim. Needs Python 3.8+, `pipx`, and a Go
+toolchain to build the wheel.
 
 ```bash
-# On the bastion / registry host: install + run nsdev-registry as systemd
-# (Phase 4 packaging will produce .deb/.rpm; for now build from source).
-nsdev-registry serve /etc/nsdev-registry/config.yml &
+# Build the wheel from a source checkout (Go required only here).
+pipx run --spec build pyproject-build --wheel .
+# -> dist/nsdev_registry-<ver>-py3-none-any.whl
 
+# Install (no root, per-user PATH).
+pipx install dist/nsdev_registry-<ver>-py3-none-any.whl
+
+# One-shot system bootstrap. Requires root; creates the
+# nsdev-registry user, drops the binary into /usr/bin, the systemd
+# unit into /lib/systemd/system, the default config into
+# /etc/nsdev-registry/config.yml (noreplace — keeps your edits),
+# and `systemctl enable --now`s the service. Skips the systemctl
+# step under --no-enable for container image builds.
+sudo $(pipx environment --value PIPX_BIN_DIR)/nsdev-registry-init
+```
+
+After `nsdev-registry-init`, `systemctl status nsdev-registry`
+should show the service active and listening on `5000/tcp` +
+`5000/udp`.
+
+### 2. Debian / Ubuntu (.deb)
+
+For apt-based clusters where ops prefers their distro's package
+manager.
+
+```bash
+# On a build host (Debian/Ubuntu/Arch — needs dpkg-deb, Go toolchain).
+make -C packaging deb
+# -> packaging/debbuild/nsdev-registry_<ver>-1_amd64.deb
+
+# On the target host.
+sudo dpkg -i nsdev-registry_*.deb
+sudo apt-get install -f             # pull deps if dpkg complained
+sudo systemctl status nsdev-registry
+```
+
+The postinst creates the `nsdev-registry` system user, runs
+`systemctl enable --now`, and leaves a self-signed cert in
+`/etc/nsdev-registry/tls.{crt,key}` via the unit's ExecStartPre
+hook on first start.
+
+### 3. Rocky / Fedora / RHEL (.rpm)
+
+```bash
+# On a build host (needs rpmbuild + Go toolchain).
+make -C packaging rpm
+# -> packaging/rpmbuild/RPMS/x86_64/nsdev-registry-<ver>-1.x86_64.rpm
+
+# On the target host.
+sudo dnf install nsdev-registry-*.rpm
+sudo systemctl status nsdev-registry
+```
+
+Same lifecycle hooks as the .deb (`%pre` creates the user,
+`%systemd_post` enables the service).
+
+### 4. Source (developers)
+
+```bash
+git clone https://github.com/dmitry-mikushin/nsdev-registry
+cd nsdev-registry
+git checkout nsdev-main
+
+# Just the binary, no install.
+make -C packaging binary
+./packaging/build/nsdev-registry serve packaging/config.yml.example
+
+# Full test loop:
+go test -race ./internal/... ./registry/...   # unit tests
+bash tests/e2e/run-all.sh                     # containerised E2E
+```
+
+## Quick start (operator)
+
+After installing on the bastion/registry host by any of the methods
+above:
+
+```bash
 # On the operator's laptop / build host: just push.
 nsdev push --tunnel ns-tun toolchain/rocky9:pr35867
 ```
 
 No `--stun-server`, no manual port forwards, no relay binary on the
-bastion — `nsdev push` runs the discovery + ssh handshake silently and
-attaches the bearer token to every OCI request.
+bastion — `nsdev push` runs the discovery + ssh handshake silently
+and attaches the bearer token to every OCI request.
+
+## Config knobs
+
+The default config (`/etc/nsdev-registry/config.yml` after
+install) is heavily commented; the knobs operators usually touch
+first:
+
+| Field | Default | When to change |
+|---|---|---|
+| `storage.filesystem.rootdirectory` | `/var/lib/nsdev-registry` | Point at shared NFS for cluster-wide pull |
+| `http.tls.certificate` / `.key` | `/etc/nsdev-registry/tls.{crt,key}` | Replace self-signed cert with PKI / ACME |
+| `http.addr` | `0.0.0.0:5000` | Lock TCP to `127.0.0.1` to require ssh-tunnel for `podman pull` |
+| `http.quic.addr` | `0.0.0.0:5000` | Keep externally reachable for direct `nsdev push` |
+| `http.quic.advertise` | (bind addr) | Set when registry is behind 1:1 NAT |
