@@ -54,10 +54,51 @@ This fork collapses the three into one process. Highlights:
 | Phase | Status | Scope |
 | ----- | ------ | ----- |
 | 0     | done   | Fork repo, set up branching layout, write this doc |
-| 1     | wip    | Add `http3.Server` on UDP:5000 alongside TCP listener; share handler tree |
-| 2     | tbd    | nsdev-push client switches from ssh+relay to direct HTTP/3 |
-| 3     | tbd    | SSH-bootstrapped mTLS: `sign-cert` subcommand, internal CA, automatic client cert rotation |
+| 1     | done   | Add `http3.Server` on UDP:5000 alongside TCP listener; share handler tree |
+| 2     | done   | SSH-bridged handshake (`POST /v3/sessions` + `nsdev-registry session` subcommand), bearer-token middleware on the QUIC tree, STUN-less discovery protocol on the same UDP socket, config split for separate TCP/QUIC bind + advertise. Nsdev-push (client) refactored to drop its own ssh+relay+stun code and speak HTTP/3 directly. |
+| 3     | tbd    | Optional mTLS for offline operators (long-lived SSH-bootstrapped client cert as an alternative to the per-push bearer token) |
 | 4     | tbd    | `/v3/` API: instances, hosts, leases, retention |
 | 5     | tbd    | Custom NFS storage driver (atomic tag rename via symlink, hardlink across repos for same digest) |
 
 See `ROADMAP.md` for the upstream roadmap (unchanged).
+
+## Wire protocols at a glance
+
+```
+                  ┌─────────────────────────── nsdev-registry ───────────────────────────┐
+                  │                                                                       │
+                  │   TCP :5000  ── HTTP/1.1, HTTP/2 ──▶  /v2/* (OCI)  ──▶  storage      │
+                  │                                       /v3/sessions (loopback only)    │
+                  │                                                                       │
+                  │   UDP :5000  ── HTTP/3   ─────────▶  /v2/* (OCI, Bearer-auth)        │
+                  │                  via quic.Transport                                   │
+                  │                  │                                                    │
+                  │                  └─ non-QUIC packets ─▶ discovery.Store               │
+                  │                                          (nonce → src_addr)           │
+                  └──────────────────▲────────────────────────────────────────────────────┘
+                                     │ probes back to client (NAT-punch)
+                                     │
+   nsdev-push  ──── ssh handshake (~300 ms) ────────────────▶ nsdev-registry session
+                  ──── HTTP/3 OCI v2 over QUIC ─────────────▶ storage
+```
+
+The discovery datagram is the STUN-equivalent: client sends one 55-byte
+packet with magic + 32-byte nonce before the ssh handshake, server's
+non-QUIC packet receiver records the kernel-observed (ip, port), and
+the handshake response carries the bearer token plus confirmation that
+the discovery succeeded.
+
+## Quick start (operator)
+
+```bash
+# On the bastion / registry host: install + run nsdev-registry as systemd
+# (Phase 4 packaging will produce .deb/.rpm; for now build from source).
+nsdev-registry serve /etc/nsdev-registry/config.yml &
+
+# On the operator's laptop / build host: just push.
+nsdev push --tunnel ns-tun toolchain/rocky9:pr35867
+```
+
+No `--stun-server`, no manual port forwards, no relay binary on the
+bastion — `nsdev push` runs the discovery + ssh handshake silently and
+attaches the bearer token to every OCI request.
