@@ -184,6 +184,34 @@ type HTTP struct {
 
 	// H2C configures support for HTTP/2 without requiring TLS (HTTP/2 Cleartext).
 	H2C H2C `yaml:"h2c,omitempty"`
+
+	// QUIC configures the optional HTTP/3-over-QUIC listener that
+	// nsdev-registry runs alongside the TCP HTTP listener. It binds a
+	// UDP socket on its own host:port (independent of `addr`, which is
+	// TCP-only). HTTP/3 requires TLS, so this listener is only brought
+	// up when TLS is configured. See registry/quicserver.go for the
+	// runtime side.
+	QUIC QUIC `yaml:"quic,omitempty"`
+}
+
+// QUIC configures the HTTP/3-over-QUIC data path. Independent of the TCP
+// listener so an operator can bind TCP loopback-only (e.g. for the
+// ssh-tunnelled /v3/sessions handshake) while exposing UDP externally
+// for nsdev-push, or vice versa.
+type QUIC struct {
+	// Addr is the UDP bind address. Empty falls back to HTTP.Addr so
+	// existing configurations stay one-line.
+	Addr string `yaml:"addr,omitempty"`
+
+	// Advertise is the externally reachable UDP endpoint that the
+	// /v3/sessions handshake hands back to clients. Useful when the
+	// registry is behind a 1:1 NAT or load balancer and the bind
+	// address is private. Empty defaults to Addr.
+	Advertise string `yaml:"advertise,omitempty"`
+
+	// Disabled turns the QUIC listener off entirely. Default is to
+	// enable whenever TLS is configured.
+	Disabled bool `yaml:"disabled,omitempty"`
 }
 
 // Debug defines the configuration options for the registry's debug interface.

@@ -340,36 +340,40 @@ func (registry *Registry) ListenAndServe() error {
 		ln = tls.NewListener(ln, tlsConf)
 		dcontext.GetLogger(registry.app).Infof("listening on %v, tls", ln.Addr())
 
-		// Bring up the parallel QUIC (HTTP/3) listener on the same
-		// numerical port as the TCP listener. TCP and UDP are
-		// independent L4 sockets, so binding both on e.g. :5000
-		// simultaneously is fine — the kernel routes by protocol
-		// number, no SO_REUSEPORT or byte-sniffing tricks needed.
-		//
-		// The QUIC handler wraps the same App tree as the TCP
-		// listener but PREFIXED with tokenauth.Middleware: every
-		// data-path request must carry an Authorization: Bearer
-		// <token> header where the token was issued earlier through
-		// /v3/sessions over the loopback-only TCP path. This is what
-		// gates nsdev-push pushes coming in over UDP.
-		baseHandler := registry.server.Handler
-		quicHandler := tokenauth.Middleware(registry.sessions, baseHandler)
-		quicSrv, err := startQUICServer(registry.app, config.HTTP.Addr, tlsConf, quicHandler)
-		if err != nil {
-			return fmt.Errorf("starting quic listener: %w", err)
-		}
-		registry.quicListener = quicSrv
+		// Bring up the parallel QUIC (HTTP/3) listener. UDP bind is
+		// resolved separately from the TCP `addr` so an operator can
+		// expose them on different interfaces — e.g. TCP loopback for
+		// the ssh-tunnelled /v3/sessions handshake, UDP 0.0.0.0 for
+		// direct nsdev-push pushes from outside the cluster. Both
+		// addresses fall back to the legacy http.addr when their own
+		// http.quic.{addr,advertise} fields are empty, so existing
+		// configurations stay one-line.
+		if !config.HTTP.QUIC.Disabled {
+			quicAddr := config.HTTP.QUIC.Addr
+			if quicAddr == "" {
+				quicAddr = config.HTTP.Addr
+			}
+			baseHandler := registry.server.Handler
+			quicHandler := tokenauth.Middleware(registry.sessions, baseHandler)
+			quicSrv, err := startQUICServer(registry.app, quicAddr, tlsConf, quicHandler)
+			if err != nil {
+				return fmt.Errorf("starting quic listener: %w", err)
+			}
+			if config.HTTP.QUIC.Advertise != "" {
+				quicSrv.SetAdvertisedAddr(config.HTTP.QUIC.Advertise)
+			}
+			registry.quicListener = quicSrv
 
-		// The TCP handler additionally serves /v3/sessions — the
-		// ssh-gated handshake endpoint that issues bearer tokens and
-		// fires NAT-punching probes from the QUIC listener's socket.
-		// We mount it AFTER constructing quicSrv so the session
-		// handler has a live QuicPuncher to advertise + punch through.
-		sessionH := handlers.NewSessionHandler(registry.sessions, quicSrv)
-		v3Mux := http.NewServeMux()
-		v3Mux.Handle("/v3/sessions", sessionH)
-		v3Mux.Handle("/", baseHandler)
-		registry.server.Handler = v3Mux
+			// /v3/sessions runs on the TCP handler tree (next to
+			// the standard /v2/ surface), holding a QuicPuncher
+			// reference so it can advertise the right UDP endpoint
+			// and fire NAT-punching probes from the QUIC socket.
+			sessionH := handlers.NewSessionHandler(registry.sessions, quicSrv)
+			v3Mux := http.NewServeMux()
+			v3Mux.Handle("/v3/sessions", sessionH)
+			v3Mux.Handle("/", baseHandler)
+			registry.server.Handler = v3Mux
+		}
 	} else {
 		dcontext.GetLogger(registry.app).Infof("listening on %v", ln.Addr())
 	}
