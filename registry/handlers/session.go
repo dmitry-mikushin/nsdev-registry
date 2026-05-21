@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/distribution/distribution/v3/internal/dcontext"
+	"github.com/distribution/distribution/v3/internal/discovery"
 	"github.com/distribution/distribution/v3/internal/session"
 )
 
@@ -23,12 +24,19 @@ type SessionRequest struct {
 	// User is the authenticated operator identity, taken from $SSH_USER
 	// on the server side of the ssh session.
 	User string `json:"user"`
-	// ClientUDPAddr is the operator's UDP probe endpoint, in "ip:port"
-	// form. The session handler fires NAT-punching probes at this
-	// address from the QUIC listener's socket so the operator's
-	// subsequent ClientHello sees a stable 5-tuple, matching what
-	// nsdev-push's old relay.rs did before this rewrite.
-	ClientUDPAddr string `json:"client_udp_addr"`
+	// ClientUDPAddr is the operator's claimed UDP probe endpoint, in
+	// "ip:port" form. Used as the punch target ONLY when DiscoveryNonce
+	// is empty or unresolved — see the field below.
+	ClientUDPAddr string `json:"client_udp_addr,omitempty"`
+	// DiscoveryNonce is the hex-encoded nonce the operator sent in a
+	// discovery UDP packet to the registry's QUIC port BEFORE invoking
+	// this handshake. If present AND the registry's discovery store
+	// has a matching entry, the punch target becomes the address the
+	// kernel actually observed for that packet — i.e. the post-NAT
+	// 5-tuple — and ClientUDPAddr is ignored. This is the
+	// STUN-equivalent path: the registry trusts what it saw on the
+	// wire over what the client claims.
+	DiscoveryNonce string `json:"discovery_nonce,omitempty"`
 	// RequestedTTL, if non-zero, asks for a specific token lifetime.
 	// The server clamps to its own MaxTTL.
 	RequestedTTL time.Duration `json:"requested_ttl,omitempty"`
@@ -44,14 +52,23 @@ type SessionResponse struct {
 	ProbesSent     int       `json:"probes_sent"`
 	IssuedToUser   string    `json:"issued_to_user"`
 	IssuedToClient string    `json:"issued_to_client"`
+	// DiscoveryUsed is true when the punch target was sourced from the
+	// discovery store rather than the client-supplied ClientUDPAddr.
+	// nsdev-push uses this as a positive confirmation that the
+	// STUN-less hole-punching path completed end-to-end; if false,
+	// the client should suspect a port-translating NAT and fall back
+	// to user-attention diagnostics.
+	DiscoveryUsed bool `json:"discovery_used"`
 }
 
 // QuicPuncher is the slice of the quic listener that the session handler
-// needs to reach: the externally reachable UDP endpoint to advertise, and
-// the ability to fire probes at the client.
+// needs to reach: the externally reachable UDP endpoint to advertise, the
+// ability to fire probes at the client, and the discovery store the
+// non-QUIC packet receiver populates.
 type QuicPuncher interface {
 	AdvertisedAddr() string
 	Punch(ctx context.Context, dst string, count int, spacing time.Duration) error
+	Discovery() *discovery.Store
 }
 
 // SessionHandler issues short-lived bearer tokens to ssh-authenticated
@@ -115,15 +132,57 @@ func (h *SessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
-	if req.ClientUDPAddr == "" {
-		http.Error(w, "session: client_udp_addr is required",
-			http.StatusBadRequest)
-		return
+
+	// Resolve the punch target. Two paths:
+	//
+	//   (a) discovery_nonce: the client sent a UDP discovery packet to
+	//       the registry's QUIC port BEFORE this handshake. The packet
+	//       receiver in registry/quicserver.go recorded (nonce -> the
+	//       kernel-observed src 5-tuple) in discovery.Store. We look
+	//       it up here and use the OBSERVED address, which captures the
+	//       client's true post-NAT external (IP, port) — including
+	//       symmetric-NAT port remapping that the client itself cannot
+	//       know about. This is the STUN-equivalent path.
+	//
+	//   (b) client_udp_addr fallback: when the client cannot reach the
+	//       registry's UDP port directly to send a discovery packet
+	//       (e.g. firewall blocks outbound UDP), it instead claims an
+	//       address. We dutifully fire probes at it; if the claim was
+	//       wrong (NAT translated the port) the probes go nowhere, but
+	//       the client's own QUIC ClientHello may still open the path
+	//       since QUIC is client-initiated.
+	//
+	// The client is required to supply at least one of the two.
+	var punchTarget string
+	discoveryUsed := false
+	if req.DiscoveryNonce != "" {
+		if entry, ok := h.Quic.Discovery().Lookup(req.DiscoveryNonce); ok {
+			punchTarget = entry.SrcAddr.String()
+			discoveryUsed = true
+			dcontext.GetLogger(r.Context()).Infof(
+				"session: discovery nonce %s -> observed %s",
+				req.DiscoveryNonce[:8]+"...", punchTarget)
+		} else {
+			dcontext.GetLogger(r.Context()).Warnf(
+				"session: discovery nonce %s not found in store; "+
+					"falling back to client_udp_addr",
+				req.DiscoveryNonce[:8]+"...")
+		}
 	}
-	if _, err := net.ResolveUDPAddr("udp", req.ClientUDPAddr); err != nil {
-		http.Error(w, fmt.Sprintf("session: invalid client_udp_addr %q: %v",
-			req.ClientUDPAddr, err), http.StatusBadRequest)
-		return
+	if punchTarget == "" {
+		if req.ClientUDPAddr == "" {
+			http.Error(w,
+				"session: either discovery_nonce (resolved) or "+
+					"client_udp_addr must be supplied",
+				http.StatusBadRequest)
+			return
+		}
+		if _, err := net.ResolveUDPAddr("udp", req.ClientUDPAddr); err != nil {
+			http.Error(w, fmt.Sprintf("session: invalid client_udp_addr %q: %v",
+				req.ClientUDPAddr, err), http.StatusBadRequest)
+			return
+		}
+		punchTarget = req.ClientUDPAddr
 	}
 
 	ttl := req.RequestedTTL
@@ -131,7 +190,7 @@ func (h *SessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ttl = h.MaxTTL
 	}
 
-	tok, entry, err := h.Store.Issue(req.User, req.ClientUDPAddr, ttl)
+	tok, entry, err := h.Store.Issue(req.User, punchTarget, ttl)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("session: issue token: %v", err),
 			http.StatusInternalServerError)
@@ -143,14 +202,14 @@ func (h *SessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the probes have already landed at the client's NAT mapping and any
 	// firewall state is primed for the inbound ClientHello.
 	probesSent := h.ProbeCount
-	if err := h.Quic.Punch(r.Context(), req.ClientUDPAddr,
+	if err := h.Quic.Punch(r.Context(), punchTarget,
 		h.ProbeCount, h.ProbeStep); err != nil {
 		// A probe write failure isn't fatal — the client may still
 		// reach us via its own outbound ClientHello opening the NAT
 		// mapping. Log + reduce the reported probe count so the
 		// client knows to retry sooner if its NAT is symmetric.
 		dcontext.GetLogger(r.Context()).Warnf(
-			"session: punch error for %s: %v", req.ClientUDPAddr, err)
+			"session: punch error for %s: %v", punchTarget, err)
 		probesSent = 0
 	}
 
@@ -161,6 +220,7 @@ func (h *SessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ProbesSent:     probesSent,
 		IssuedToUser:   entry.User,
 		IssuedToClient: entry.ClientAddr,
+		DiscoveryUsed:  discoveryUsed,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(&resp); err != nil {

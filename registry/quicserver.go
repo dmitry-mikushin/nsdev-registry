@@ -14,6 +14,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 
 	"github.com/distribution/distribution/v3/internal/dcontext"
+	"github.com/distribution/distribution/v3/internal/discovery"
 )
 
 // quicALPN is the ALPN token for HTTP/3 (RFC 9114 §3.1).
@@ -21,8 +22,8 @@ const quicALPN = "h3"
 
 // probeMagic is the first byte of every NAT-punching probe packet we send.
 // Real QUIC packets always have bit 0x40 (the "fixed bit") set in their
-// first byte (RFC 9000 §17.2/§17.3), so 0x00 unambiguously distinguishes
-// a probe from a QUIC packet the kernel might deliver to the same socket.
+// first byte (RFC 9000 §17.2/§17.3); 0x00 unambiguously distinguishes a
+// probe from a QUIC packet the kernel might deliver to the same socket.
 // The client picks the probes off the socket BEFORE handing it to its own
 // QUIC stack, so they never reach quic-go.
 const probeMagic = byte(0x00)
@@ -31,28 +32,50 @@ const probeMagic = byte(0x00)
 // `tcpdump` shows something sensible during debugging.
 var probeBody = []byte("NSDEV-REGISTRY-PROBE\n")
 
-// QuicListener wraps the UDP socket the QUIC HTTP/3 server uses, so the
-// session handler can fire NAT-punching probes through the SAME 5-tuple
-// the client's subsequent QUIC ClientHello will use. Without that, a
-// symmetric-NAT-bound client would see incoming server packets from a
-// different port and drop them.
+// QuicListener owns the UDP socket the QUIC HTTP/3 server uses, plus the
+// non-QUIC packet receiver that backs the STUN-less discovery protocol
+// in internal/discovery. Layering looks like this:
 //
-// The pattern mirrors what nsdev-push's relay.rs did before this rewrite:
-// 10 small UDP datagrams toward the operator's discovered (ip:port),
-// spaced ~50ms, to open the NAT mapping ahead of the QUIC handshake.
+//	          *net.UDPConn  (single UDP socket, e.g. :5000)
+//	               │
+//	      quic.Transport.Conn                   ← we wrap the conn so the
+//	     ┌─────────┴─────────────┐                 same socket can carry
+//	     │                       │                 both QUIC traffic AND
+//	  QUIC packets         non-QUIC packets        opaque discovery probes
+//	     │                       │
+//	  http3.Server          discovery.Store
+//	  (OCI v2 over h3)      (nonce → src_addr,
+//	                         filled in by the
+//	                         non-QUIC packet
+//	                         receiver goroutine)
+//
+// The session handler reads the discovery store to look up the REAL
+// post-NAT external address the client appeared at, so the bearer-token
+// handshake doesn't have to trust the address the client claims for
+// itself in --probe-port.
 type QuicListener struct {
-	srv     *http3.Server
-	udpConn *net.UDPConn
-	// advertise is the externally reachable UDP endpoint we tell clients
-	// to dial. Defaults to the bind address; can be overridden when the
-	// registry is behind a static NAT and the bind address is private.
+	transport *quic.Transport
+	listener  *quic.EarlyListener
+	srv       *http3.Server
+	udpConn   *net.UDPConn
+
+	// discovery is the nonce→src_addr lookup table populated by the
+	// non-QUIC packet receiver. The session handler dereferences it
+	// when it sees `discovery_nonce` in a SessionRequest.
+	discovery *discovery.Store
+
+	// advertise overrides the externally reachable UDP endpoint
+	// reported to clients via /v3/sessions. Defaults to the bind addr.
 	advertise string
 
-	// muProbe serialises Punch invocations so concurrent session handshakes
-	// don't interleave their probe bursts on the shared socket. Writes to
-	// a UDP socket are thread-safe in Go's net package, so this is purely
-	// to keep traffic patterns clean for debugging.
+	// muProbe serialises Punch invocations so concurrent session
+	// handshakes don't interleave their probe bursts on the shared
+	// socket.
 	muProbe sync.Mutex
+
+	// cancel stops the non-QUIC packet receiver on Close.
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // AdvertisedAddr returns the externally reachable UDP endpoint the
@@ -71,11 +94,16 @@ func (q *QuicListener) SetAdvertisedAddr(addr string) {
 	q.advertise = addr
 }
 
+// Discovery returns the discovery store this listener feeds. The
+// session handler queries it to translate `discovery_nonce` into the
+// observed post-NAT source address.
+func (q *QuicListener) Discovery() *discovery.Store {
+	return q.discovery
+}
+
 // Punch fires `count` probe datagrams from the QUIC listener's socket
-// toward dst, with `spacing` between datagrams. It returns the first
-// write error, if any (subsequent errors are logged and ignored).
-//
-// Reasonable defaults that mirror relay.rs: count=10, spacing=50ms.
+// toward dst, with `spacing` between datagrams. Defaults: count=10,
+// spacing=50ms, mirroring relay.rs's behaviour.
 func (q *QuicListener) Punch(ctx context.Context, dst string, count int, spacing time.Duration) error {
 	if count <= 0 {
 		count = 10
@@ -113,9 +141,10 @@ func (q *QuicListener) Punch(ctx context.Context, dst string, count int, spacing
 }
 
 // startQUICServer brings up an HTTP/3 listener on the same UDP address as
-// the TCP port the registry is already serving on. The provided handler is
-// the same handler tree the TCP `http.Server` uses, so OCI v2 (and the
-// future `/v3/` endpoints) work identically over HTTP/3.
+// the TCP port the registry is already serving on, AND a side-car non-QUIC
+// packet receiver that powers the discovery protocol. The provided
+// handler is the same handler tree the TCP `http.Server` uses, so OCI v2
+// (and the future `/v3/` endpoints) work identically over HTTP/3.
 //
 // tlsConf must already carry a non-nil GetCertificate or Certificates
 // slice — i.e. TLS must be configured. HTTP/3 requires TLS; running plain
@@ -126,8 +155,7 @@ func startQUICServer(ctx context.Context, addr string, tlsConf *tls.Config, hand
 	}
 
 	// Clone TLS config so we don't mutate the one the TCP listener uses;
-	// HTTP/3 needs ALPN "h3" advertised. quic-go enforces this and will
-	// reject incoming connections that don't negotiate it.
+	// HTTP/3 needs ALPN "h3" advertised.
 	quicTLS := tlsConf.Clone()
 	if !hasALPN(quicTLS.NextProtos, quicALPN) {
 		quicTLS.NextProtos = append([]string{quicALPN}, quicTLS.NextProtos...)
@@ -142,6 +170,19 @@ func startQUICServer(ctx context.Context, addr string, tlsConf *tls.Config, hand
 		return nil, err
 	}
 
+	// quic.Transport lets us share the UDP socket between QUIC traffic
+	// and our discovery sub-protocol. The transport's
+	// ReadNonQUICPacket channel surfaces any packet whose first two
+	// bits are zero — exactly what our discovery packets are crafted
+	// to look like.
+	transport := &quic.Transport{Conn: udpConn}
+
+	listener, err := transport.ListenEarly(http3.ConfigureTLSConfig(quicTLS), defaultQUICConfig())
+	if err != nil {
+		_ = udpConn.Close()
+		return nil, fmt.Errorf("quic: ListenEarly: %w", err)
+	}
+
 	srv := &http3.Server{
 		Handler:    handler,
 		TLSConfig:  http3.ConfigureTLSConfig(quicTLS),
@@ -151,22 +192,78 @@ func startQUICServer(ctx context.Context, addr string, tlsConf *tls.Config, hand
 	dcontext.GetLoggerWithField(ctx, "addr", udpConn.LocalAddr().String()).
 		Info("listening on quic (udp), tls")
 
+	ql := &QuicListener{
+		transport: transport,
+		listener:  listener,
+		srv:       srv,
+		udpConn:   udpConn,
+		discovery: discovery.NewStore(0),
+	}
+
+	receiverCtx, cancel := context.WithCancel(ctx)
+	ql.cancel = cancel
+
+	// h3 server goroutine.
+	ql.wg.Add(1)
 	go func() {
-		if err := srv.Serve(udpConn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, quic.ErrServerClosed) {
+		defer ql.wg.Done()
+		if err := srv.ServeListener(listener); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) &&
+			!errors.Is(err, quic.ErrServerClosed) {
 			dcontext.GetLogger(ctx).Errorf("quic server exited with error: %v", err)
 		}
 	}()
 
-	return &QuicListener{
-		srv:     srv,
-		udpConn: udpConn,
-	}, nil
+	// Non-QUIC packet receiver. Filters incoming packets through the
+	// discovery store; anything that isn't a recognised discovery
+	// packet is silently dropped (likely a stray probe, port scan, or
+	// truncated QUIC packet that didn't fit quic-go's heuristic).
+	ql.wg.Add(1)
+	go func() {
+		defer ql.wg.Done()
+		buf := make([]byte, 2048)
+		for {
+			n, src, err := transport.ReadNonQUICPacket(receiverCtx, buf)
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				if errors.Is(err, net.ErrClosed) || receiverCtx.Err() != nil {
+					return
+				}
+				dcontext.GetLogger(ctx).Warnf(
+					"discovery: ReadNonQUICPacket: %v", err)
+				return
+			}
+			if !ql.discovery.HandlePacket(buf[:n], src) {
+				// Packet didn't match our discovery format — could
+				// be a stray probe from another tool, an old client,
+				// or a port scan. Logged at debug only because the
+				// public UDP port is a likely target for noise.
+				dcontext.GetLoggerWithField(ctx, "src", src).
+					Debugf("discovery: ignoring %d-byte non-discovery packet", n)
+			}
+		}
+	}()
+
+	return ql, nil
 }
 
-// Close stops the underlying http3.Server. The UDP socket is closed as a
-// side-effect of http3.Server.Close.
+// Close stops the underlying http3.Server, the non-QUIC packet receiver,
+// and releases the UDP socket. Idempotent.
 func (q *QuicListener) Close() error {
-	return q.srv.Close()
+	if q.cancel != nil {
+		q.cancel()
+	}
+	var err error
+	if q.srv != nil {
+		err = q.srv.Close()
+	}
+	if q.transport != nil {
+		_ = q.transport.Close()
+	}
+	q.wg.Wait()
+	return err
 }
 
 // hasALPN reports whether `proto` is already present in `protos`.

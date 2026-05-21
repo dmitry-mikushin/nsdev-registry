@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,17 +15,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/distribution/distribution/v3/internal/discovery"
 	"github.com/distribution/distribution/v3/internal/session"
 )
 
 // mockPuncher satisfies QuicPuncher with assertion-friendly fields. Tests
 // can pre-load PunchErr to simulate write failures; PunchCalls records
-// every Punch invocation for ordering / arg verification.
+// every Punch invocation for ordering / arg verification. The Disco field
+// is a real discovery.Store so tests can seed it (via HandlePacket) the
+// same way the production non-QUIC packet receiver would.
 type mockPuncher struct {
-	mu             sync.Mutex
-	Advertised     string
-	PunchErr       error
-	PunchCalls     []punchCall
+	mu         sync.Mutex
+	Advertised string
+	Disco      *discovery.Store
+	PunchErr   error
+	PunchCalls []punchCall
 }
 
 type punchCall struct {
@@ -32,7 +38,8 @@ type punchCall struct {
 	Spacing time.Duration
 }
 
-func (m *mockPuncher) AdvertisedAddr() string { return m.Advertised }
+func (m *mockPuncher) AdvertisedAddr() string         { return m.Advertised }
+func (m *mockPuncher) Discovery() *discovery.Store   { return m.Disco }
 
 func (m *mockPuncher) Punch(_ context.Context, dst string, count int, spacing time.Duration) error {
 	m.mu.Lock()
@@ -44,7 +51,10 @@ func (m *mockPuncher) Punch(_ context.Context, dst string, count int, spacing ti
 
 func newHandler() (*SessionHandler, *session.Store, *mockPuncher) {
 	store := session.NewStore()
-	puncher := &mockPuncher{Advertised: "registry.local:5000"}
+	puncher := &mockPuncher{
+		Advertised: "registry.local:5000",
+		Disco:      discovery.NewStore(0),
+	}
 	return NewSessionHandler(store, puncher), store, puncher
 }
 
@@ -249,5 +259,130 @@ func TestSession_ResponseContentType(t *testing.T) {
 	var v map[string]any
 	if err := json.NewDecoder(bytes.NewReader(w.Body.Bytes())).Decode(&v); err != nil {
 		t.Fatalf("response not valid JSON: %v", err)
+	}
+}
+
+// seedDiscovery records (nonceHex -> srcAddr) in the puncher's discovery
+// store the same way the production non-QUIC packet receiver would.
+// Returns the nonceHex string for use in the request body.
+func seedDiscovery(t *testing.T, p *mockPuncher, srcAddr string) string {
+	t.Helper()
+	nonce := make([]byte, discoveryNonceSize)
+	for i := range nonce {
+		nonce[i] = byte(i) // deterministic for test readability
+	}
+	pkt := make([]byte, len(discoveryMagic)+len(nonce))
+	copy(pkt, discoveryMagic)
+	copy(pkt[len(discoveryMagic):], nonce)
+
+	src, err := net.ResolveUDPAddr("udp", srcAddr)
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr: %v", err)
+	}
+	if !p.Disco.HandlePacket(pkt, src) {
+		t.Fatal("Disco.HandlePacket: false")
+	}
+	return hexEncode(nonce)
+}
+
+// Mirror constants from internal/discovery to keep this test file
+// self-contained (no internal import gymnastics).
+const (
+	discoveryMagic     = "\x00NSDEV-DISCOVERY-V1\n"
+	discoveryNonceSize = 32
+)
+
+func hexEncode(b []byte) string {
+	const digits = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, c := range b {
+		out[i*2] = digits[c>>4]
+		out[i*2+1] = digits[c&0x0f]
+	}
+	return string(out)
+}
+
+func TestSession_DiscoveryNonceResolvedPrefersObservedAddr(t *testing.T) {
+	h, _, puncher := newHandler()
+	// The CLIENT claims its UDP addr is 10.0.0.1:55555 (a guess based
+	// on what its OWN socket bound — wrong if there's port-translating
+	// NAT). But the discovery store says the registry actually
+	// observed the packet from 203.0.113.42:18000.
+	nonceHex := seedDiscovery(t, puncher, "203.0.113.42:18000")
+	body := fmt.Sprintf(
+		`{"user":"u","client_udp_addr":"10.0.0.1:55555","discovery_nonce":%q}`,
+		nonceHex)
+	w := postJSON(t, h, body, "127.0.0.1:1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, body=%s", w.Code, w.Body.String())
+	}
+	var resp SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.DiscoveryUsed {
+		t.Error("DiscoveryUsed=false; expected true when nonce resolves")
+	}
+	if resp.IssuedToClient != "203.0.113.42:18000" {
+		t.Errorf("IssuedToClient=%q, want observed addr 203.0.113.42:18000",
+			resp.IssuedToClient)
+	}
+	if len(puncher.PunchCalls) != 1 {
+		t.Fatalf("Punch calls=%d, want 1", len(puncher.PunchCalls))
+	}
+	if puncher.PunchCalls[0].Dst != "203.0.113.42:18000" {
+		t.Errorf("Punch.Dst=%q, want observed addr",
+			puncher.PunchCalls[0].Dst)
+	}
+}
+
+func TestSession_DiscoveryNonceMissFallsBackToClientUDPAddr(t *testing.T) {
+	h, _, _ := newHandler()
+	body := `{"user":"u","client_udp_addr":"10.0.0.1:55555",` +
+		`"discovery_nonce":"deadbeef"}` // nonce never seeded
+	w := postJSON(t, h, body, "127.0.0.1:1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d", w.Code)
+	}
+	var resp SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.DiscoveryUsed {
+		t.Error("DiscoveryUsed=true; expected false on store miss")
+	}
+	if resp.IssuedToClient != "10.0.0.1:55555" {
+		t.Errorf("IssuedToClient=%q, want client_udp_addr fallback",
+			resp.IssuedToClient)
+	}
+}
+
+func TestSession_OnlyDiscoveryNoFallbackAddrAllowed(t *testing.T) {
+	h, _, puncher := newHandler()
+	nonceHex := seedDiscovery(t, puncher, "198.51.100.1:23000")
+	body := fmt.Sprintf(
+		`{"user":"u","discovery_nonce":%q}`, nonceHex)
+	w := postJSON(t, h, body, "127.0.0.1:1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, body=%s", w.Code, w.Body.String())
+	}
+	var resp SessionResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.DiscoveryUsed {
+		t.Error("DiscoveryUsed=false; want true")
+	}
+	if resp.IssuedToClient != "198.51.100.1:23000" {
+		t.Errorf("IssuedToClient=%q", resp.IssuedToClient)
+	}
+}
+
+func TestSession_NeitherNonceNorAddrIs400(t *testing.T) {
+	h, _, _ := newHandler()
+	// Missing nonce AND missing client_udp_addr should fail validation.
+	w := postJSON(t, h, `{"user":"u"}`, "127.0.0.1:1")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status=%d, want 400", w.Code)
 	}
 }

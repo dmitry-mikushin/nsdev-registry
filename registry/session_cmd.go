@@ -16,10 +16,11 @@ import (
 // session subcommand flags. Defaults match the documented port for the
 // loopback TCP listener (see NEXTSILICON.md).
 var (
-	sessionServerURL string
-	sessionProbePort int
-	sessionUserFlag  string
-	sessionInsecure  bool
+	sessionServerURL     string
+	sessionProbePort     int
+	sessionUserFlag      string
+	sessionInsecure      bool
+	sessionDiscoveryHex  string
 )
 
 func init() {
@@ -30,8 +31,17 @@ func init() {
 			"reached via ssh by the operator)")
 	SessionCmd.Flags().IntVar(&sessionProbePort,
 		"probe-port", 0,
-		"operator-side UDP port that nsdev-push has bound and "+
-			"wants the registry to NAT-punch back to (required)")
+		"operator-side UDP port for the NAT-punch fallback path. "+
+			"Used only if --discovery-nonce is unresolved (or omitted); "+
+			"the registry then punches at $SSH_CLIENT_IP:probe-port "+
+			"which is correct only on port-preserving NATs.")
+	SessionCmd.Flags().StringVar(&sessionDiscoveryHex,
+		"discovery-nonce", "",
+		"hex-encoded nonce that nsdev-push already sent in a UDP "+
+			"discovery packet to the registry's QUIC port; when set, "+
+			"the registry uses the kernel-observed source address "+
+			"for that nonce instead of trusting --probe-port, which "+
+			"gives correct hole-punching under symmetric NAT")
 	SessionCmd.Flags().StringVar(&sessionUserFlag,
 		"user", "",
 		"override the operator identity (defaults to $SSH_USER, then $USER)")
@@ -87,22 +97,34 @@ var SessionCmd = &cobra.Command{
 				"session: cannot determine user — pass --user or set $SSH_USER")
 		}
 
-		if sessionProbePort <= 0 || sessionProbePort > 65535 {
+		// The handshake needs at least one path for the punch target —
+		// either a discovery nonce the operator already exchanged with
+		// the registry over UDP (preferred: works through symmetric
+		// NAT), or a (ssh-client-ip, probe-port) tuple for the
+		// port-preserving NAT fallback.
+		if sessionDiscoveryHex == "" && sessionProbePort == 0 {
 			return fmt.Errorf(
-				"session: --probe-port must be 1..65535 (got %d)",
+				"session: supply --discovery-nonce, --probe-port, or both")
+		}
+		if sessionProbePort < 0 || sessionProbePort > 65535 {
+			return fmt.Errorf(
+				"session: --probe-port must be 0..65535 (got %d)",
 				sessionProbePort)
 		}
 
-		clientIP, err := operatorSourceIP()
-		if err != nil {
-			return fmt.Errorf("session: %w", err)
+		body := map[string]any{"user": user}
+		if sessionDiscoveryHex != "" {
+			body["discovery_nonce"] = sessionDiscoveryHex
 		}
-		clientUDPAddr := fmt.Sprintf("%s:%d", clientIP, sessionProbePort)
+		if sessionProbePort > 0 {
+			clientIP, err := operatorSourceIP()
+			if err != nil {
+				return fmt.Errorf("session: %w", err)
+			}
+			body["client_udp_addr"] = fmt.Sprintf("%s:%d", clientIP, sessionProbePort)
+		}
 
-		body, err := json.Marshal(map[string]any{
-			"user":            user,
-			"client_udp_addr": clientUDPAddr,
-		})
+		payload, err := json.Marshal(body)
 		if err != nil {
 			return err
 		}
@@ -114,7 +136,7 @@ var SessionCmd = &cobra.Command{
 		client := &http.Client{Transport: tr}
 
 		url := strings.TrimRight(sessionServerURL, "/") + "/v3/sessions"
-		resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+		resp, err := client.Post(url, "application/json", bytes.NewReader(payload))
 		if err != nil {
 			return fmt.Errorf("session: POST %s: %w", url, err)
 		}
