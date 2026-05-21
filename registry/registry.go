@@ -16,7 +16,6 @@ import (
 	logstash "github.com/bshuster-repo/logrus-logstash-hook"
 	"github.com/docker/go-metrics"
 	gorhandlers "github.com/gorilla/handlers"
-	"github.com/quic-go/quic-go/http3"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -28,6 +27,8 @@ import (
 	"github.com/distribution/distribution/v3/configuration"
 	"github.com/distribution/distribution/v3/health"
 	"github.com/distribution/distribution/v3/internal/dcontext"
+	"github.com/distribution/distribution/v3/internal/session"
+	"github.com/distribution/distribution/v3/internal/tokenauth"
 	"github.com/distribution/distribution/v3/registry/handlers"
 	"github.com/distribution/distribution/v3/registry/listener"
 	"github.com/distribution/distribution/v3/tracing"
@@ -137,12 +138,20 @@ type Registry struct {
 	config *configuration.Configuration
 	app    *handlers.App
 	server *http.Server
-	// quicServer is the optional HTTP/3-over-QUIC listener that runs on
+	// quicListener is the optional HTTP/3-over-QUIC listener that runs on
 	// the same numerical port as `server` but on UDP. It is non-nil only
-	// when TLS is configured (HTTP/3 has no plaintext mode). The same
-	// handler tree as `server` is used.
-	quicServer *http3.Server
-	quit       chan os.Signal
+	// when TLS is configured (HTTP/3 has no plaintext mode). The QUIC
+	// handler tree is the OCI v2 app wrapped in tokenauth.Middleware —
+	// distinct from the TCP handler tree, which exposes /v3/sessions
+	// (the loopback-only handshake endpoint) and the unauthenticated
+	// /v2/ surface.
+	quicListener *QuicListener
+	// sessions backs the /v3/sessions handshake endpoint and the
+	// tokenauth middleware. Tokens issued through ssh-tunnelled TCP
+	// authorise QUIC pushes; the store is purely in-memory so restarts
+	// invalidate every outstanding token (operators just re-handshake).
+	sessions *session.Store
+	quit     chan os.Signal
 }
 
 // NewRegistry creates a new registry from a context and configuration struct.
@@ -183,10 +192,11 @@ func NewRegistry(ctx context.Context, config *configuration.Configuration) (*Reg
 	}
 
 	return &Registry{
-		app:    app,
-		config: config,
-		server: server,
-		quit:   make(chan os.Signal, 1),
+		app:      app,
+		config:   config,
+		server:   server,
+		sessions: session.NewStore(),
+		quit:     make(chan os.Signal, 1),
 	}, nil
 }
 
@@ -331,16 +341,35 @@ func (registry *Registry) ListenAndServe() error {
 		dcontext.GetLogger(registry.app).Infof("listening on %v, tls", ln.Addr())
 
 		// Bring up the parallel QUIC (HTTP/3) listener on the same
-		// numerical port as the TCP listener, sharing the same
-		// http.Handler tree. TCP and UDP are independent L4 sockets, so
-		// binding both on e.g. :5000 simultaneously is fine and standard.
-		// nsdev-push prefers this path; podman/docker/curl-without-http3
-		// continue using the TCP listener above.
-		quicSrv, err := startQUICServer(registry.app, config.HTTP.Addr, tlsConf, registry.server.Handler)
+		// numerical port as the TCP listener. TCP and UDP are
+		// independent L4 sockets, so binding both on e.g. :5000
+		// simultaneously is fine — the kernel routes by protocol
+		// number, no SO_REUSEPORT or byte-sniffing tricks needed.
+		//
+		// The QUIC handler wraps the same App tree as the TCP
+		// listener but PREFIXED with tokenauth.Middleware: every
+		// data-path request must carry an Authorization: Bearer
+		// <token> header where the token was issued earlier through
+		// /v3/sessions over the loopback-only TCP path. This is what
+		// gates nsdev-push pushes coming in over UDP.
+		baseHandler := registry.server.Handler
+		quicHandler := tokenauth.Middleware(registry.sessions, baseHandler)
+		quicSrv, err := startQUICServer(registry.app, config.HTTP.Addr, tlsConf, quicHandler)
 		if err != nil {
 			return fmt.Errorf("starting quic listener: %w", err)
 		}
-		registry.quicServer = quicSrv
+		registry.quicListener = quicSrv
+
+		// The TCP handler additionally serves /v3/sessions — the
+		// ssh-gated handshake endpoint that issues bearer tokens and
+		// fires NAT-punching probes from the QUIC listener's socket.
+		// We mount it AFTER constructing quicSrv so the session
+		// handler has a live QuicPuncher to advertise + punch through.
+		sessionH := handlers.NewSessionHandler(registry.sessions, quicSrv)
+		v3Mux := http.NewServeMux()
+		v3Mux.Handle("/v3/sessions", sessionH)
+		v3Mux.Handle("/", baseHandler)
+		registry.server.Handler = v3Mux
 	} else {
 		dcontext.GetLogger(registry.app).Infof("listening on %v", ln.Addr())
 	}
@@ -373,12 +402,12 @@ func (registry *Registry) ListenAndServe() error {
 // Shutdown gracefully shuts down the registry's HTTP server and application object.
 func (registry *Registry) Shutdown(ctx context.Context) error {
 	err := registry.server.Shutdown(ctx)
-	if registry.quicServer != nil {
+	if registry.quicListener != nil {
 		// http3.Server.Close stops accepting new connections and cancels
 		// in-flight streams. There is no graceful Shutdown variant in the
 		// quic-go API as of v0.59; the TCP server's Shutdown above already
 		// gave clients the chance to drain.
-		if quicErr := registry.quicServer.Close(); quicErr != nil {
+		if quicErr := registry.quicListener.Close(); quicErr != nil {
 			err = errors.Join(err, quicErr)
 		}
 	}
