@@ -1,0 +1,55 @@
+# Default /etc/nsdev-registry/config.yml — works out of the box for a
+# single-host deployment.
+#
+# Key knobs an operator usually edits on first install:
+#
+#   storage.filesystem.rootdirectory  — where blobs live. Default is
+#       /var/lib/nsdev-registry (managed by the systemd StateDirectory).
+#       Point at NFS / /space*/ shared storage for cluster-wide pull
+#       deployments.
+#
+#   http.tls.{certificate,key}  — where the TLS material is read from.
+#       The default paths are populated by init-cert.sh (run by the
+#       systemd unit's ExecStartPre) with a self-signed cert if they
+#       are absent. Replace with a real PKI cert at any time; restart
+#       the service to pick it up.
+#
+#   http.addr  — TCP bind, used by `podman pull` / `docker push`. Bind
+#       to 0.0.0.0 to expose it cluster-wide, or to 127.0.0.1 to
+#       require an ssh-tunnel (the loopback-only /v3/sessions handshake
+#       enforces this for the handshake API regardless of bind).
+#
+#   http.quic.addr  — UDP bind for the HTTP/3 path nsdev-push uses.
+#       This is the only port nsdev-push needs to reach directly; keep
+#       it externally reachable for fast operator pushes.
+#
+#   http.quic.advertise  — what /v3/sessions tells clients to dial.
+#       Set when the registry is behind a 1:1 NAT and the bind address
+#       is a private IP. Defaults to http.quic.addr when empty.
+
+version: 0.1
+
+log:
+  level: info
+  formatter: text
+
+storage:
+  filesystem:
+    rootdirectory: /var/lib/nsdev-registry
+
+http:
+  addr: 0.0.0.0:5000
+  tls:
+    certificate: /etc/nsdev-registry/tls.crt
+    key:         /etc/nsdev-registry/tls.key
+  quic:
+    addr: 0.0.0.0:5000
+    # advertise: ns-tun.example.com:5000
+
+# Health check endpoint at /. Useful for systemd watchdogs / load
+# balancers; harmless when unused.
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3

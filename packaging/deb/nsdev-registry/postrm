@@ -1,0 +1,38 @@
+#!/bin/sh
+# nsdev-registry postrm — daemon-reload after the unit file is gone;
+# on full purge also clean up the system user and the on-disk state
+# directory.
+
+set -e
+
+case "$1" in
+    remove|disappear)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+    purge)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        # Best-effort tidy-up. Deliberately NOT removing
+        # /etc/nsdev-registry/tls.{crt,key} because the operator
+        # may have replaced them with PKI material they want to
+        # keep across re-installs.
+        rm -rf /var/lib/nsdev-registry || true
+        if getent passwd nsdev-registry >/dev/null; then
+            deluser --quiet --system nsdev-registry > /dev/null || true
+        fi
+        if getent group nsdev-registry >/dev/null; then
+            delgroup --quiet --system nsdev-registry > /dev/null || true
+        fi
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade)
+        ;;
+    *)
+        echo "postrm called with unknown argument: $1" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

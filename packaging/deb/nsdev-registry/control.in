@@ -1,0 +1,28 @@
+Package: nsdev-registry
+Version: @PKG_VERSION@-1
+Section: admin
+Priority: optional
+Architecture: amd64
+Maintainer: Dmitry Mikushin <dmitry@kernelgen.org>
+Homepage: https://github.com/dmitry-mikushin/nsdev-registry
+Depends: openssl,
+ passwd,
+ systemd,
+ adduser
+Description: OCI Distribution v2 registry with HTTP/3 + ssh-bridged handshake
+ nsdev-registry is a fork of distribution/distribution (the upstream
+ container registry) extended with a parallel HTTP/3-over-QUIC listener
+ on the same port as the standard TCP listener, an ssh-bridged
+ handshake endpoint that issues short-lived bearer tokens, and a
+ STUN-less hole-punching discovery protocol.
+ .
+ Together they let nsdev-push speak HTTP/3 directly to the registry
+ over UDP at full wire-line bandwidth while standard tooling
+ (podman pull, docker push, crane, oras) continues to work unchanged
+ over TCP.
+ .
+ This package ships:
+   * /usr/bin/nsdev-registry — the daemon binary
+   * /usr/libexec/nsdev-registry/init-cert.sh — first-run TLS bootstrap
+   * /etc/nsdev-registry/config.yml — example configuration
+   * /lib/systemd/system/nsdev-registry.service — systemd unit

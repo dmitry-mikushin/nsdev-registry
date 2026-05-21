@@ -1,0 +1,46 @@
+#!/bin/sh
+# nsdev-registry postinst — create the unprivileged system user the
+# daemon runs as, then enable + start (or restart on upgrade) the
+# systemd unit. Mirrors the RPM %pre + %systemd_post macros.
+
+set -e
+
+case "$1" in
+    configure)
+        # User creation: idempotent across re-installs and upgrades.
+        # `adduser --system` is the Debian-idiomatic call; `groupadd`
+        # / `useradd` from shadow-utils work on Debian too via the
+        # `passwd` package but the `adduser` wrapper produces a
+        # uid/gid in the system range without ceremony.
+        if ! getent group nsdev-registry >/dev/null; then
+            addgroup --system nsdev-registry
+        fi
+        if ! getent passwd nsdev-registry >/dev/null; then
+            adduser --system --ingroup nsdev-registry \
+                    --home /var/lib/nsdev-registry --no-create-home \
+                    --shell /usr/sbin/nologin \
+                    --gecos "nsdev-registry daemon" \
+                    nsdev-registry
+        fi
+
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+            if [ -z "$2" ]; then
+                # Fresh install: enable + start.
+                systemctl enable --now nsdev-registry.service || true
+            else
+                # Upgrade: pick up the new binary without flipping
+                # operator-set state.
+                systemctl try-restart nsdev-registry.service || true
+            fi
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument: $1" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

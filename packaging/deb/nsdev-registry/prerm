@@ -1,0 +1,21 @@
+#!/bin/sh
+# nsdev-registry prerm — stop the daemon before files are removed.
+# Mirrors the RPM %systemd_preun macro.
+
+set -e
+
+case "$1" in
+    remove)
+        if [ -d /run/systemd/system ]; then
+            systemctl --no-reload disable --now nsdev-registry.service || true
+        fi
+        ;;
+    upgrade|deconfigure|failed-upgrade)
+        ;;
+    *)
+        echo "prerm called with unknown argument: $1" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
