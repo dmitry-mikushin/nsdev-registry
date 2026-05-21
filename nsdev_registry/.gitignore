@@ -1,0 +1,4 @@
+# Populated at wheel build time by setup.py — Go binary + systemd
+# unit / config / init-cert.sh staged from packaging/. Generated, not
+# committed.
+data/

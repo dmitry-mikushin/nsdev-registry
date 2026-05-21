@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nsdev-registry"
+version = "0.1.0"
+description = "OCI Distribution v2 registry with HTTP/3 + ssh-bridged handshake — pip wrapper around the Go daemon"
+requires-python = ">=3.8"
+authors = [{ name = "Dmitry Mikushin", email = "dmitry@kernelgen.org" }]
+license = { text = "Apache-2.0" }
+
+[project.scripts]
+nsdev-registry      = "nsdev_registry.cli:main"
+nsdev-registry-init = "nsdev_registry.init:main"
+
+[tool.setuptools]
+packages = ["nsdev_registry"]
+
+[tool.setuptools.package-data]
+# Populated by setup.py: the Go binary, plus the systemd unit, the
+# default config, and init-cert.sh. Distributed inside the wheel so a
+# single `pipx install` produces a working install without separate
+# downloads or apt/dnf.
+nsdev_registry = ["data/**/*"]
