@@ -16,6 +16,7 @@ import (
 	logstash "github.com/bshuster-repo/logrus-logstash-hook"
 	"github.com/docker/go-metrics"
 	gorhandlers "github.com/gorilla/handlers"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -136,7 +137,12 @@ type Registry struct {
 	config *configuration.Configuration
 	app    *handlers.App
 	server *http.Server
-	quit   chan os.Signal
+	// quicServer is the optional HTTP/3-over-QUIC listener that runs on
+	// the same numerical port as `server` but on UDP. It is non-nil only
+	// when TLS is configured (HTTP/3 has no plaintext mode). The same
+	// handler tree as `server` is used.
+	quicServer *http3.Server
+	quit       chan os.Signal
 }
 
 // NewRegistry creates a new registry from a context and configuration struct.
@@ -323,6 +329,18 @@ func (registry *Registry) ListenAndServe() error {
 
 		ln = tls.NewListener(ln, tlsConf)
 		dcontext.GetLogger(registry.app).Infof("listening on %v, tls", ln.Addr())
+
+		// Bring up the parallel QUIC (HTTP/3) listener on the same
+		// numerical port as the TCP listener, sharing the same
+		// http.Handler tree. TCP and UDP are independent L4 sockets, so
+		// binding both on e.g. :5000 simultaneously is fine and standard.
+		// nsdev-push prefers this path; podman/docker/curl-without-http3
+		// continue using the TCP listener above.
+		quicSrv, err := startQUICServer(registry.app, config.HTTP.Addr, tlsConf, registry.server.Handler)
+		if err != nil {
+			return fmt.Errorf("starting quic listener: %w", err)
+		}
+		registry.quicServer = quicSrv
 	} else {
 		dcontext.GetLogger(registry.app).Infof("listening on %v", ln.Addr())
 	}
@@ -355,6 +373,15 @@ func (registry *Registry) ListenAndServe() error {
 // Shutdown gracefully shuts down the registry's HTTP server and application object.
 func (registry *Registry) Shutdown(ctx context.Context) error {
 	err := registry.server.Shutdown(ctx)
+	if registry.quicServer != nil {
+		// http3.Server.Close stops accepting new connections and cancels
+		// in-flight streams. There is no graceful Shutdown variant in the
+		// quic-go API as of v0.59; the TCP server's Shutdown above already
+		// gave clients the chance to drain.
+		if quicErr := registry.quicServer.Close(); quicErr != nil {
+			err = errors.Join(err, quicErr)
+		}
+	}
 	if appErr := registry.app.Shutdown(); appErr != nil {
 		err = errors.Join(err, appErr)
 	}
